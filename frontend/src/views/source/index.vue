@@ -2,37 +2,76 @@
   <section class="page" data-module="source">
     <header class="page-head">
       <div>
-        <h2>数据源管理管理</h2>
-        <p class="page-desc">维护数据源连接的输入、执行约束与结果记录，为数据源管理提供可验证的数据工程流程。</p>
-      </div>
-      <div class="page-actions">
-        <button class="btn primary" type="button" @click="openCreate">登记数据源连接</button>
-        <button class="btn" type="button" @click="exportRows">导出数据源管理清单</button>
+        <h2>数据源管理</h2>
+        <p class="page-desc">
+          连接签章是两端资格锁的资格凭据：撤回签章等于摘除连接/换成未获批连接，所有绑定它的同步链路立即阻断；
+          本页与数据同步、任务监控读取同一份阻断凭据。
+        </p>
       </div>
     </header>
 
-    <div class="stat-row">
-      <article v-for="item in stats" :key="item.label" class="stat-card">
-        <span class="stat-label">{{ item.label }}</span>
-        <strong class="stat-value">{{ item.value }}</strong>
-      </article>
+    <h3 style="margin: 8px 0">连接签章（资格凭据）</h3>
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>签章</th>
+          <th>角色</th>
+          <th>连接编号</th>
+          <th>连接名称</th>
+          <th>版本</th>
+          <th>签章状态</th>
+          <th>原因</th>
+          <th>受影响链路阻断凭据</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr v-for="seal in seals" :key="seal.sealId">
+          <td class="mono">{{ seal.sealId }}</td>
+          <td>{{ roleLabel(seal.role) }}</td>
+          <td class="mono">{{ seal.endpointCode }}</td>
+          <td>{{ seal.endpointName }}</td>
+          <td class="mono">v{{ seal.version }}</td>
+          <td>
+            <span class="badge" :class="seal.status === 'active' ? 'green' : 'red'">
+              {{ seal.status === 'active' ? '有效' : '已撤回' }}
+            </span>
+          </td>
+          <td>{{ seal.reason }}</td>
+          <td>
+            <span v-if="blockedBySeal(seal.sealId).length" class="badge red">
+              阻断 {{ blockedBySeal(seal.sealId).map((item) => item.linkCode).join('、') }}
+            </span>
+            <span v-else class="badge green">无阻断</span>
+          </td>
+          <td class="row-actions">
+            <button
+              v-if="seal.status === 'active'"
+              class="link"
+              type="button"
+              @click="revoke(seal.sealId)"
+            >撤回签章</button>
+            <button
+              v-else
+              class="link"
+              type="button"
+              @click="reissue(seal.sealId)"
+            >重新签发（版本+1）</button>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div v-if="blockedCredentials.length" class="credential-banner" style="margin-top: 12px">
+      <strong>当前阻断凭据（与同步、监控同源）：</strong>
+      <ul>
+        <li v-for="item in blockedCredentials" :key="item.linkId">
+          {{ item.linkCode }}：{{ item.reason }}（锁序号 {{ item.lockSeq }}）
+        </li>
+      </ul>
     </div>
 
-    <p class="status-legend">
-      <span v-for="item in statusSummary" :key="item.status" class="legend-item">
-        {{ item.status }}：{{ item.count }}
-      </span>
-    </p>
-
-    <form class="filter-bar" @submit.prevent="reload">
-      <label v-for="field in filterFields" :key="field" class="filter-item">
-        <span>{{ field }}</span>
-        <input v-model="filters[field]" :placeholder="`按${field}检索`" />
-      </label>
-      <button class="btn" type="submit">查询</button>
-      <button class="btn ghost" type="button" @click="resetFilters">重置条件</button>
-    </form>
-
+    <h3 style="margin: 16px 0 8px">连接登记台账（脚手架数据）</h3>
     <table class="data-table">
       <thead>
         <tr>
@@ -57,15 +96,12 @@
             </button>
           </td>
         </tr>
-        <tr v-if="!rows.length">
-          <td :colspan="columns.length + 2" class="empty-state">暂无数据源管理数据，可先登记数据源连接</td>
-        </tr>
       </tbody>
     </table>
 
     <footer class="page-foot">
-      <span>共 {{ total }} 条数据源管理记录</span>
-      <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
+      <span>共 {{ seals.length }} 枚连接签章 · {{ blockedCredentials.length }} 条阻断凭据</span>
+      <span v-if="message" :class="messageOk ? '' : 'error-text'">{{ message }}</span>
     </footer>
   </section>
 </template>
@@ -74,64 +110,62 @@
 import { computed, onMounted, ref } from 'vue'
 
 import {
-  downloadEntries,
   listEntries,
   moduleMeta,
   runAction as applyAction,
 } from '@/api/local-service'
+import { roleLabel, syncLockService } from '@/domain/sync-lock/service'
+import type { BlockingCredential, EndpointSeal } from '@/domain/sync-lock/types'
 import type { EntryRow } from '@/data/types'
 
 const meta = moduleMeta('source')
-const columns = ["连接编号", "连接类型", "接入地址", "认证方式", "连接池配置", "超时秒数", "重试次数", "负责人"]
-const actions = ["提交连通", "建立连接", "断开连接"]
-const statuses = ["草稿", "待连通", "已连通", "已断开"]
-const stats = [{"label": "数据源连接总数", "value": 0}, {"label": "已连通连接", "value": 0}, {"label": "待连通连接", "value": 0}]
+const columns = ['连接编号', '连接类型', '接入地址', '认证方式', '连接池配置', '超时秒数', '重试次数', '负责人']
+const actions = ['提交连通', '建立连接', '断开连接']
+
+const tick = ref(0)
+const seals = computed<EndpointSeal[]>(() => {
+  void tick.value
+  return syncLockService.listSeals()
+})
+const allCredentials = computed<BlockingCredential[]>(() => {
+  void tick.value
+  return syncLockService.listLinks().map((link) => syncLockService.getBlockingCredential(link.linkId))
+})
+const blockedCredentials = computed(() => allCredentials.value.filter((item) => item.blocked))
 
 const rows = ref<EntryRow[]>([])
-const total = ref(0)
-const errorMessage = ref('')
-const filters = ref<Record<string, string>>({})
-const filterFields = columns.slice(0, 3)
-const statusSummary = computed(() =>
-  statuses.map((status: string) => ({
-    status,
-    count: rows.value.filter((row) => String(row.status) === status).length,
-  })),
-)
+const message = ref('')
+const messageOk = ref(true)
 
-function resetFilters() {
-  filters.value = {}
-  reload()
+function blockedBySeal(sealId: string): BlockingCredential[] {
+  return blockedCredentials.value.filter((item) => item.revokedSealIds.includes(sealId))
 }
 
-function exportRows() {
-  downloadEntries(meta.key)
+function notify(ok: boolean, text: string): void {
+  messageOk.value = ok
+  message.value = text
+  tick.value += 1
 }
 
-function openCreate() {
-  errorMessage.value = '数据源连接登记入口尚未接入审批流'
+function revoke(sealId: string): void {
+  const result = syncLockService.revokeSeal(sealId, '值班管理员手动撤回连接签章')
+  notify(result.ok, result.message)
 }
 
-function runAction(action: string, row: EntryRow) {
-  errorMessage.value = ''
+function reissue(sealId: string): void {
+  const result = syncLockService.reissueSeal(sealId, '连接资格重新获批，换发新签章')
+  notify(result.ok, `${result.message}，请在数据同步页对阻断链路执行恢复并重新绑定`)
+}
+
+function runAction(action: string, row: EntryRow): void {
   const result = applyAction(meta.key, Number(row.id), action)
-  if (!result.ok) {
-    errorMessage.value = result.message
-    return
-  }
-  reload()
-}
-
-function reload() {
-  errorMessage.value = ''
-  try {
-    const payload = listEntries(meta.key, filters.value)
-    rows.value = payload.items
-    total.value = payload.total
-  } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '数据源管理列表读取失败'
+  notify(result.ok, result.message)
+  if (result.ok) {
+    rows.value = listEntries(meta.key).items
   }
 }
 
-onMounted(reload)
+onMounted(() => {
+  rows.value = listEntries(meta.key).items
+})
 </script>

@@ -3,36 +3,51 @@
     <header class="page-head">
       <div>
         <h2>任务监控管理</h2>
-        <p class="page-desc">维护任务监控配置的输入、执行约束与结果记录，为任务运行监控提供可验证的数据工程流程。</p>
-      </div>
-      <div class="page-actions">
-        <button class="btn primary" type="button" @click="openCreate">登记监控配置</button>
-        <button class="btn" type="button" @click="exportRows">导出任务监控清单</button>
+        <p class="page-desc">
+          监控读数与数据同步、数据源读取同一份阻断凭据：两端任一签章撤回，链路一律红灯，
+          不再出现“链路挂着运行绿灯、延迟读数正常”的假象；延迟只反映最后签收分片。
+        </p>
       </div>
     </header>
 
-    <div class="stat-row">
-      <article v-for="item in stats" :key="item.label" class="stat-card">
-        <span class="stat-label">{{ item.label }}</span>
-        <strong class="stat-value">{{ item.value }}</strong>
-      </article>
+    <h3 style="margin: 8px 0">同步链路监控（MONI 读数 · 与资格锁同源）</h3>
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>监控编号</th>
+          <th>链路</th>
+          <th>运行终态</th>
+          <th>信号灯</th>
+          <th>阻断原因（同源凭据）</th>
+          <th>最后签收分片</th>
+          <th>缺口分片</th>
+          <th>源水位</th>
+          <th>目标水位</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr v-for="item in readouts" :key="item.linkId">
+          <td class="mono">MONI-{{ item.linkCode }}</td>
+          <td>{{ item.linkCode }}</td>
+          <td>{{ statusLabel(item.linkStatus) }}</td>
+          <td>
+            <span class="badge" :class="item.lamp">{{ lampLabel(item.lamp) }}</span>
+          </td>
+          <td>{{ item.blocked ? item.blockedReason : '—' }}</td>
+          <td>#{{ item.lastAckedShard }}</td>
+          <td>{{ item.gapShards.length ? '#' + item.gapShards.join('、#') : '无' }}</td>
+          <td class="mono">{{ item.sourceWatermark ?? '—' }}</td>
+          <td class="mono">{{ item.targetWatermark ?? '—（新目标未写入）' }}</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div v-if="redCount" class="credential-banner" style="margin-top: 12px">
+      <strong>{{ redCount }} 条链路红灯：</strong>监控不再对阻断链路报绿灯，延迟读数停在最后签收分片，恢复后仅补缺口。
     </div>
+    <div v-else class="credential-banner clear" style="margin-top: 12px">全部链路资格有效，监控灯与同步终态一致。</div>
 
-    <p class="status-legend">
-      <span v-for="item in statusSummary" :key="item.status" class="legend-item">
-        {{ item.status }}：{{ item.count }}
-      </span>
-    </p>
-
-    <form class="filter-bar" @submit.prevent="reload">
-      <label v-for="field in filterFields" :key="field" class="filter-item">
-        <span>{{ field }}</span>
-        <input v-model="filters[field]" :placeholder="`按${field}检索`" />
-      </label>
-      <button class="btn" type="submit">查询</button>
-      <button class="btn ghost" type="button" @click="resetFilters">重置条件</button>
-    </form>
-
+    <h3 style="margin: 16px 0 8px">监控配置台账（脚手架数据）</h3>
     <table class="data-table">
       <thead>
         <tr>
@@ -57,15 +72,12 @@
             </button>
           </td>
         </tr>
-        <tr v-if="!rows.length">
-          <td :colspan="columns.length + 2" class="empty-state">暂无任务监控数据，可先登记监控配置</td>
-        </tr>
       </tbody>
     </table>
 
     <footer class="page-foot">
-      <span>共 {{ total }} 条任务监控记录</span>
-      <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
+      <span>红灯 {{ redCount }} · 黄灯 {{ amberCount }} · 绿灯 {{ greenCount }}</span>
+      <span v-if="message" :class="messageOk ? '' : 'error-text'">{{ message }}</span>
     </footer>
   </section>
 </template>
@@ -73,65 +85,37 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 
-import {
-  downloadEntries,
-  listEntries,
-  moduleMeta,
-  runAction as applyAction,
-} from '@/api/local-service'
+import { listEntries, moduleMeta, runAction as applyAction } from '@/api/local-service'
+import { lampLabel, statusLabel, syncLockService } from '@/domain/sync-lock/service'
+import type { MonitorReadout } from '@/domain/sync-lock/types'
 import type { EntryRow } from '@/data/types'
 
 const meta = moduleMeta('monitor')
-const columns = ["配置编号", "关联任务", "监控指标", "告警阈值", "告警级别", "静默分钟", "通知渠道", "恢复条件"]
-const actions = ["提交校验", "启用监控", "停用监控"]
-const statuses = ["草稿", "待校验", "已启用", "已停用"]
-const stats = [{"label": "监控配置总数", "value": 0}, {"label": "已启用配置", "value": 0}, {"label": "待校验配置", "value": 0}]
+const columns = ['配置编号', '关联任务', '监控指标', '告警阈值', '告警级别', '静默分钟', '通知渠道', '恢复条件']
+const actions = ['提交校验', '启用监控', '停用监控']
+
+// 监控页不自己判断链路状态：全部读数来自引擎 getMonitorReadout，与阻断凭据同源
+const readouts = computed<MonitorReadout[]>(() =>
+  syncLockService.listLinks().map((link) => syncLockService.getMonitorReadout(link.linkId)),
+)
+const redCount = computed(() => readouts.value.filter((item) => item.lamp === 'red').length)
+const amberCount = computed(() => readouts.value.filter((item) => item.lamp === 'amber').length)
+const greenCount = computed(() => readouts.value.filter((item) => item.lamp === 'green').length)
 
 const rows = ref<EntryRow[]>([])
-const total = ref(0)
-const errorMessage = ref('')
-const filters = ref<Record<string, string>>({})
-const filterFields = columns.slice(0, 3)
-const statusSummary = computed(() =>
-  statuses.map((status: string) => ({
-    status,
-    count: rows.value.filter((row) => String(row.status) === status).length,
-  })),
-)
+const message = ref('')
+const messageOk = ref(true)
 
-function resetFilters() {
-  filters.value = {}
-  reload()
-}
-
-function exportRows() {
-  downloadEntries(meta.key)
-}
-
-function openCreate() {
-  errorMessage.value = '监控配置登记入口尚未接入审批流'
-}
-
-function runAction(action: string, row: EntryRow) {
-  errorMessage.value = ''
+function runAction(action: string, row: EntryRow): void {
   const result = applyAction(meta.key, Number(row.id), action)
-  if (!result.ok) {
-    errorMessage.value = result.message
-    return
-  }
-  reload()
-}
-
-function reload() {
-  errorMessage.value = ''
-  try {
-    const payload = listEntries(meta.key, filters.value)
-    rows.value = payload.items
-    total.value = payload.total
-  } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '任务监控列表读取失败'
+  messageOk.value = result.ok
+  message.value = result.message
+  if (result.ok) {
+    rows.value = listEntries(meta.key).items
   }
 }
 
-onMounted(reload)
+onMounted(() => {
+  rows.value = listEntries(meta.key).items
+})
 </script>

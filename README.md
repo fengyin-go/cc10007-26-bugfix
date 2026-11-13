@@ -70,5 +70,31 @@ npm run build
 - 状态流转只允许在 `local-service.ts` 里改，页面组件不做业务判断。
 - 想回到初始数据：清掉浏览器里 `data-layer-studio:entries` 这一项，或调用 `resetModule(模块)`。
 
+## 数据同步：两端资格锁
+
+数据同步页（`frontend/src/views/datasync/index.vue`）不使用通用脚手架的状态流转，而是由独立领域引擎
+`frontend/src/domain/sync-lock/` 驱动，修复“源端摘除连接印章 / 目标换成未获批连接，链路却继续挂绿灯”的问题：
+
+- **两端资格锁**：运行计划同时绑定源端、目标端各自的当前签章（`sealId + version`）。任一签章撤回
+  （连接摘除、未获批、换发新版本）链路立即阻断，停在最后签收分片，监控灯强制红灯。
+- **恢复只补缺口**：恢复时重新绑定换发的签章版本，只投递 `gap/rolledback` 分片，已签收分片不重复写；
+  切换目标后旧目标水位作废（`targetWatermark = null`），新目标从缺口分片重建水位，绝不把旧源水位写进新目标。
+- **锁序号定终态**：所有变更入口统一领取全局单调 `lockSeq`；切换目标与停链交叉时，以最大锁序号事件定终态，
+  同一确认键（`链路:目标签章:版本:分片号`）在 `confirmIndex` 中只登记一次，不产生两份写入。
+- **阻断凭据同源**：数据同步、数据源管理（`source`）、任务监控（`monitor`）三处都调用
+  `getBlockingCredential / getMonitorReadout` 读取同一份凭据，监控不再对阻断链路报绿灯。
+- **生命周期留痕**：状态切换 → 恢复 → 归档 → 回退按 `LIFECYCLE_ORDER` 顺序记录到事件时间线，乱序操作被拒绝。
+- 资格锁数据持久化在浏览器 `data-layer-studio:sync-lock:v1`，与脚手架数据互不影响；数据同步页可一键重置演示数据。
+
+### 资格锁引擎验证
+
+不依赖第三方测试框架，行为用例在 `frontend/tests/sync-lock.verify.ts`，覆盖阻断、缺口恢复、
+目标切换水位隔离、交叉操作锁序号终态、确认键幂等、生命周期顺序、三处凭据同源、持久化等 14 个场景：
+
+```bash
+cd frontend
+npm run verify:sync-lock
+```
+
 领域：数据工程
 子方向：数仓与数据湖
